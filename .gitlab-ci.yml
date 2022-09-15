@@ -1,0 +1,197 @@
+# Variables that can be overriden in specific jobs:
+variables:
+  IMAGE: $CI_REGISTRY_IMAGE:${CI_COMMIT_REF_SLUG}-${CI_COMMIT_SHORT_SHA}
+  NB_PARALLEL_TESTS: 8
+  PHPSTAN_LEVEL: 5
+
+stages:
+  - prepare
+  - build
+  - test
+
+.tests:
+  stage: test
+  tags:
+    - kubernetes
+    - dev
+  cache: []
+  variables:
+    REPORTDIR: $CI_PROJECT_DIR/reports
+  before_script:
+    - mkdir -p $REPORTDIR || true
+    - test -d /code || mkdir -v /code
+    - cd /code
+  dependencies: []
+
+.build:
+  image:
+    name: docker.io/moby/buildkit:rootless
+    entrypoint: [ "sh", "-c" ]
+  tags:
+    - kubernetes
+    - dev
+  variables:
+    BUILDKITD_FLAGS: --oci-worker-no-process-sandbox
+  before_script:
+    - |
+      mkdir ~/.docker
+      auth=$(echo -n "$CI_REGISTRY_USER:$CI_REGISTRY_PASSWORD" | base64)
+      echo "{\"auths\": {\"$CI_REGISTRY\": {\"auth\": \"$auth\"}}}" > ~/.docker/config.json
+dependencies: []
+
+.prepare-composer:
+  stage: prepare
+  image: composer:2
+  tags:
+    - kubernetes
+    - dev
+  before_script:
+  - test -d "$(pwd)/.composer-cache" || mkdir "$(pwd)/.composer-cache"
+  - composer config -g cache-dir "$(pwd)/.composer-cache"
+  cache:
+    paths:
+    - .composer-cache/
+  artifacts:
+    expire_in: 30 min
+    paths:
+    - vendor/
+
+prepare:composer-test:
+  extends:
+   - .prepare-composer
+  script:
+  - composer install --ignore-platform-reqs --no-scripts --optimize-autoloader --no-ansi --no-interaction --no-progress
+
+prepare:composer-prod:
+  only:
+    - master
+    - tags
+  extends:
+   - .prepare-composer
+  script:
+  - composer install --ignore-platform-reqs --no-scripts --no-dev --optimize-autoloader --no-ansi --no-interaction --no-progress
+  - composer dump-autoload --no-dev --classmap-authoritative
+
+build:test:
+  extends:
+    - .build
+  stage: build
+  dependencies:
+   - prepare:composer-test
+  script:
+    - |
+      buildctl-daemonless.sh build \
+      --frontend=dockerfile.v0 \
+      --local context=. \
+      --local dockerfile=. \
+      --opt target=test \
+      --import-cache type=registry,ref=${IMAGE}-test \
+      --export-cache type=inline \
+      --output type=image,name=${IMAGE}-test,push=true
+
+build:
+  extends:
+    - .build
+  stage: build
+  dependencies:
+   - prepare:composer-prod
+  script:
+    - |
+      buildctl-daemonless.sh build \
+      --frontend=dockerfile.v0 \
+      --local context=. \
+      --local dockerfile=. \
+      --opt target=prod \
+      --import-cache type=registry,ref=${IMAGE} \
+      --export-cache type=inline \
+      --output type=image,name=${IMAGE},push=true
+only:
+    - master
+
+# run tests with base image debug
+phpunit:
+  extends: .tests
+  needs:
+    - build:test
+  image: ${IMAGE}-test
+  services:
+    - name: percona:8
+      alias: mysql
+  variables:
+    MYSQL_DATABASE: $CI_PROJECT_NAME
+    MYSQL_USER: $CI_PROJECT_NAME
+    MYSQL_PASSWORD: $CI_PROJECT_NAME
+    MYSQL_ROOT_PASSWORD: "shouldNeverBeUsed"
+    XDEBUG_MODE: coverage
+    APP_ENV: test
+  script:
+  - if [ "$DISABLE_PHPUNIT" -eq 1 ]; then exit 0; fi
+  - source .env
+  - source .env.test
+  - test -f /usr/bin/mysqladmin || (apt-get update && apt-get install -y mariadb-client)
+  - composer validate
+  # Prepare env : install JWT keys, dump variables for easy debugging, ...
+  - php bin/console lexik:jwt:generate-keypair && chmod 0644 config/jwt/*.pem
+  - mkdir $REPORTDIR/phpunit
+  - env -i PATH=$PATH HOME=$HOME php bin/console debug:container --env-vars
+  # wait for MySQL to be available
+  - bash -c '[ -z "${DISABLE_DOCTRINE+x}" ] && mysqladmin -hmysql -uroot --password="shouldNeverBeUsed" -w5 ping'
+  # Create missing databases (one per thread)
+  - bash -c 'for i in $(seq 1 ${NB_PARALLEL_TESTS}); do echo "CREATE DATABASE ${CI_PROJECT_NAME}_$i" |mysql -uroot --password="shouldNeverBeUsed" -hmysql; done'
+  - if [ -z "${DISABLE_DOCTRINE+x}" ]; then echo "use mysql; GRANT ALL ON *.* TO '${CI_PROJECT_NAME}'@'%' ; FLUSH PRIVILEGES;" |mysql -uroot --password="shouldNeverBeUsed" -hmysql; fi
+  # Load schema on all these databases
+  - bash -c '[ -z "${DISABLE_DOCTRINE+x}" ] && for i in $(seq 1 ${NB_PARALLEL_TESTS}); do  env -i TEST_TOKEN=$i PATH=$PATH HOME=$HOME php bin/console doctrine:schema:update --force -vvv || exit 0 ; done'
+  # setup transports correctly for tests
+  - bash -c '[ -z "${DISABLE_DOCTRINE+x}" ] && for i in $(seq 1 ${NB_PARALLEL_TESTS}); do  env -i TEST_TOKEN=$i PATH=$PATH HOME=$HOME php bin/console messenger:setup-transports -n || exit 0 ; done'
+  # Final run
+  # TODO: enable '--runner WrapperRunner' to be faster (buggy atm)
+  - echo -e "section_start:`date +%s`:phpunit\r\e[0KPHPUnit run"
+  - if [ -f ".xdebug_filter.php" ]; then export XDEBUGFILTER="'-dauto_prepend_file=.xdebug_filter.php'"; fi
+  # Final sed is used to remove all colors from output to make codecoverage calculation works, with no regard to --colors option (cannot be set through paratest)
+  - env -i PATH=$PATH HOME=$HOME vendor/bin/paratest --processes=${NB_PARALLEL_TESTS} --passthru-php="'-dmemory_limit=512m' $XDEBUGFILTER" --coverage-text --coverage-cobertura="${CI_PROJECT_DIR}/coverage.cobertura.xml" | sed -r "s/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[mGK]//g"
+  # Rewrite Cobertura report because source code is not in the correct folder
+  - sed -i "s@<source>/code/src</source>@<source>${CI_PROJECT_DIR}/src</source>@" "${CI_PROJECT_DIR}/coverage.cobertura.xml"
+  - RET=$? ; echo -e "section_end:`date +%s`:phpunit\r\e[0K" ; exit $RET
+  
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.cobertura.xml
+  coverage: '/^\s*Lines:\s*\d+.\d+\%/'
+
+security:
+  extends: .tests
+  needs:
+    - build:test
+  image: $IMAGE-test
+  # if symfony security website is down, we want to be able to work :)
+  allow_failure: true
+  cache:
+    key: global
+    paths: 
+      - local-php-security-checker
+  script:
+    - test -f local-php-security-checker || curl -L -o local-php-security-checker https://github.com/fabpot/local-php-security-checker/releases/download/v1.0.0/local-php-security-checker_1.0.0_linux_amd64
+    - chmod +x local-php-security-checker
+    - ./local-php-security-checker > $REPORTDIR/security.txt || true
+    - cat $REPORTDIR/security.txt
+    - grep "No packages have known vulnerabilities" $REPORTDIR/security.txt || false
+  artifacts:
+    when: on_failure
+    paths: [$REPORTDIR]
+    expire_in: 1 month
+
+stan:
+  extends: .tests
+  needs:
+    - build:test
+  image: $IMAGE-test
+  allow_failure: true
+  script:
+    - php bin/console cache:warmup --env=dev
+    - php -dxdebug.enable=0 -dmemory_limit=-1 vendor/bin/phpstan analyse --level ${PHPSTAN_LEVEL} --error-format=gitlab > "${CI_PROJECT_DIR}/codeclimate.json"
+    - /bin/ls -lah "${CI_PROJECT_DIR}/codeclimate.json"
+  artifacts:
+    reports:
+      codequality: codeclimate.json
