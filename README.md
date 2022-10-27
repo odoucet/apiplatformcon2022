@@ -3,6 +3,12 @@
 Ce repository contient tous les exemples mentionnés pendant la conférenc "Tests avancés"
 que j'ai eu l'occasion de produire pendant l'API Platform Con les 15 et 16 septembre 2022.
 
+Erreurs
+-------
+C'est du live, on est à l'oral, et un certain nombre d'erreurs se sont glissées dans mon talk :) Les voici : 
+- Les transactions sur les tests unitaires ne sont pas natives, il faut utiliser le trait `RefreshDatabaseTrait`.
+- Non, on n'utilise pas les fixtures de base (cela fait tellement longtemps que j'ai oublié ...) mais `hautelook/alice-bundle` avec des fixtures en yaml.
+
 
 Tester une API distante sans l'appeler
 -------------------------------------
@@ -19,6 +25,8 @@ Tester les ACLs
 ---------------
 Voilà quelques exemples de codes utilisés chez nous : 
 ```
+// getAdminClient() fait appel à static::createClient()
+
 $response = $this->getAdminClient()->request('GET', '/flavors');
 self::assertResponseIsSuccessful();
 self::assertCount(6, $response->toArray()['hydra:member']);
